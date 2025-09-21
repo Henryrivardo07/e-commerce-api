@@ -1,0 +1,183 @@
+// ---------- GENERATOR & DATASOURCE ----------
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------- ENUMS ----------
+enum FulfillmentStatus {
+  NEW
+  CONFIRMED
+  SHIPPED
+  COMPLETED
+  CANCELLED
+}
+
+enum PaymentStatus {
+  UNPAID
+  PAID
+  REFUNDED
+}
+
+// ---------- MODELS ----------
+model User {
+  id       Int     @id @default(autoincrement())
+  name     String
+  email    String  @unique
+  password String
+  avatarUrl String
+  phone    String?
+  // Seller Mode
+  shop     Shop?
+
+  // Buyer
+  cart    Cart?
+  orders  Order[]
+  reviews Review[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Shop {
+  id       Int     @id @default(autoincrement())
+  ownerId  Int     @unique
+  name     String
+  slug     String  @unique
+  logo     String?
+  description String?
+  address  String?
+  isActive Boolean @default(true)
+
+  owner      User        @relation(fields: [ownerId], references: [id])
+  products   Product[]
+  orderItems OrderItem[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Category {
+  id       Int       @id @default(autoincrement())
+  name     String    @unique
+  slug     String    @unique
+  products Product[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Product {
+  id          Int      @id @default(autoincrement())
+  title       String
+  slug        String    @unique      // 👈 tambahkan ini
+  description String?
+  price       Int // in minor unit (IDR: rupiah)
+  stock       Int      @default(0)
+  images      String[] @default([])
+  isActive    Boolean  @default(true)
+
+  rating      Float @default(0)
+  reviewCount Int   @default(0)
+  soldCount   Int   @default(0)
+
+  shopId     Int
+  categoryId Int
+  shop       Shop     @relation(fields: [shopId], references: [id])
+  category   Category @relation(fields: [categoryId], references: [id])
+
+  orderItems OrderItem[]
+  reviews    Review[]
+  cartItems  CartItem[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([shopId])
+  @@index([categoryId])
+}
+
+model Cart {
+  id     Int        @id @default(autoincrement())
+  userId Int        @unique
+  user   User       @relation(fields: [userId], references: [id])
+  items  CartItem[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model CartItem {
+  id            Int @id @default(autoincrement())
+  cartId        Int
+  productId     Int
+  qty           Int @default(1)
+  // snapshot price saat add (hindari shock price di cart)
+  priceSnapshot Int
+
+  cart    Cart    @relation(fields: [cartId], references: [id])
+  product Product @relation(fields: [productId], references: [id])
+
+  @@unique([cartId, productId])
+  @@index([productId])
+}
+
+model Order {
+  id            Int           @id @default(autoincrement())
+  code          String        @unique
+  userId        Int
+  addressSnap   String // snapshot alamat kirim
+  paymentStatus PaymentStatus @default(PAID) // MVP: langsung PAID
+  totalAmount   Int
+
+  user  User        @relation(fields: [userId], references: [id])
+  items OrderItem[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+}
+
+model OrderItem {
+  id        Int               @id @default(autoincrement())
+  orderId   Int
+  productId Int
+  shopId    Int
+  titleSnap String // snapshot nama produk
+  priceSnap Int // snapshot harga saat checkout
+  qty       Int
+  status    FulfillmentStatus @default(NEW)
+
+  order   Order   @relation(fields: [orderId], references: [id])
+  product Product @relation(fields: [productId], references: [id])
+  shop    Shop    @relation(fields: [shopId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([shopId])
+  @@index([orderId])
+  @@index([productId])
+}
+
+model Review {
+  id        Int     @id @default(autoincrement())
+  userId    Int
+  productId Int
+  star      Int // 1..5
+  comment   String?
+
+  user    User    @relation(fields: [userId], references: [id])
+  product Product @relation(fields: [productId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@unique([userId, productId]) // 1 user 1 review per product
+  @@index([productId])
+  @@index([userId])
+}

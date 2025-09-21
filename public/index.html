@@ -1,0 +1,28 @@
+const router = require("express").Router(); router.get("/", (req, res) => {
+res.send(`
+<html>
+  <head>
+    <title>E-Commerce API</title>
+    <style>
+      body {
+        font-family: sans-serif;
+        padding: 40px;
+      }
+      h1 {
+        color: #333;
+      }
+      a {
+        display: block;
+        margin: 10px 0;
+        font-size: 18px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>🚀 E-Commerce API</h1>
+    <p>Welcome! Pilih link di bawah untuk mulai:</p>
+    <a href="/api-swagger">📖 Swagger Docs</a>
+    <a href="/health">💚 Health Check</a>
+  </body>
+</html>
+`); }); module.exports = router;
