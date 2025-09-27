@@ -301,4 +301,70 @@ router.get(
   }
 );
 
+/**
+ * @swagger
+ * /api/orders/items/{id}/complete:
+ *   patch:
+ *     summary: Buyer confirms receipt (mark order item as COMPLETED)
+ *     description: Hanya pembeli (pemilik order) yang boleh konfirmasi. Hanya bisa dari status **SHIPPED** → **COMPLETED**.
+ *     tags: [Orders]
+ *     security: [ { bearerAuth: [] } ]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: integer }
+ *     responses:
+ *       200: { description: Updated }
+ *       403: { description: Forbidden / invalid transition }
+ *       404: { description: Order item not found }
+ */
+router.patch(
+  "/items/:id/complete",
+  authenticateToken,
+  [param("id").isInt({ min: 1 })],
+  handleValidationErrors,
+  async (req, res) => {
+    try {
+      const userId = req.user.id;
+      const id = Number(req.params.id);
+
+      // ambil item + order userId untuk verifikasi kepemilikan
+      const item = await prisma.orderItem.findUnique({
+        where: { id },
+        select: {
+          id: true,
+          status: true,
+          orderId: true,
+          order: { select: { id: true, userId: true } },
+        },
+      });
+
+      if (!item) return errorResponse(res, "Order item not found", 404);
+      if (!item.order || item.order.userId !== userId) {
+        return errorResponse(res, "Forbidden", 403);
+      }
+
+      // aturan buyer: hanya dari SHIPPED -> COMPLETED
+      if (item.status !== "SHIPPED") {
+        return errorResponse(
+          res,
+          `Invalid transition for buyer: ${item.status} → COMPLETED`,
+          403
+        );
+      }
+
+      const updated = await prisma.orderItem.update({
+        where: { id },
+        data: { status: "COMPLETED" },
+      });
+
+      return successResponse(res, updated, "Order item completed");
+    } catch (e) {
+      console.error("Buyer complete error:", e);
+      return errorResponse(res);
+    }
+  }
+);
+
 module.exports = router;

@@ -6,7 +6,7 @@ const { authenticateToken } = require("../middleware/auth");
 const { handleValidationErrors } = require("../middleware/validation");
 const { successResponse, errorResponse } = require("../utils/response");
 
-// Ambil shop milik user aktif
+/** ===== Helper: dapatkan shop milik user (seller) ===== */
 async function getMyShopOr403(userId, res) {
   const shop = await prisma.shop.findUnique({ where: { ownerId: userId } });
   if (!shop) {
@@ -16,29 +16,30 @@ async function getMyShopOr403(userId, res) {
   return shop;
 }
 
-const VALID_STATUSES = [
-  "NEW",
-  "CONFIRMED",
-  "SHIPPED",
-  "COMPLETED",
-  "CANCELLED",
-];
+/** ===== Konstanta status ===== */
+// Status yang boleh DI-FILTER di GET
+const SELLER_FILTER_STATUSES = ["NEW", "CONFIRMED", "SHIPPED", "CANCELLED"];
+// Status yang boleh DI-UPDATE oleh seller (PATCH)
+const SELLER_UPDATE_STATUSES = ["CONFIRMED", "SHIPPED", "CANCELLED"];
 
-// Aturan transisi status item
-const canTransit = (from, to) => {
-  if (from === "COMPLETED") return false; // final
-  if (to === "CANCELLED") return from !== "COMPLETED";
-  const flow = ["NEW", "CONFIRMED", "SHIPPED", "COMPLETED"];
-  const iFrom = flow.indexOf(from);
-  const iTo = flow.indexOf(to);
-  return iFrom > -1 && iTo > -1 && iTo === iFrom + 1;
-};
+/** ===== Aturan transisi seller =====
+ * - NEW -> CONFIRMED
+ * - CONFIRMED -> SHIPPED
+ * - NEW|CONFIRMED -> CANCELLED
+ * - COMPLETED TIDAK bisa di-set seller (hanya buyer).
+ */
+function canSellerTransit(from, to) {
+  if (to === "CANCELLED") return from === "NEW" || from === "CONFIRMED";
+  if (from === "NEW" && to === "CONFIRMED") return true;
+  if (from === "CONFIRMED" && to === "SHIPPED") return true;
+  return false;
+}
 
 /**
  * @swagger
  * tags:
  *   - name: Seller Fulfillment
- *     description: Manage order items for your shop
+ *     description: Manage order items for your shop (seller-only)
  */
 
 /**
@@ -51,7 +52,9 @@ const canTransit = (from, to) => {
  *     parameters:
  *       - in: query
  *         name: status
- *         schema: { type: string, enum: [NEW, CONFIRMED, SHIPPED, COMPLETED, CANCELLED] }
+ *         schema:
+ *           type: string
+ *           enum: [NEW, CONFIRMED, SHIPPED, CANCELLED]
  *       - in: query
  *         name: page
  *         schema: { type: integer, default: 1 }
@@ -68,13 +71,12 @@ router.get(
   [
     query("page").optional().isInt({ min: 1 }),
     query("limit").optional().isInt({ min: 1, max: 50 }),
-    query("status").optional().isIn(VALID_STATUSES),
+    query("status").optional().isIn(SELLER_FILTER_STATUSES),
   ],
   handleValidationErrors,
   async (req, res) => {
     try {
-      const userId = req.user.id;
-      const shop = await getMyShopOr403(userId, res);
+      const shop = await getMyShopOr403(req.user.id, res);
       if (!shop) return;
 
       const { status, page = 1, limit = 10 } = req.query;
@@ -104,9 +106,15 @@ router.get(
           code: it.order?.code,
           productId: it.productId,
           qty: it.qty,
-          priceSnapshot: it.priceSnapshot,
+          priceSnapshot: it.priceSnapshot ?? it.priceSnap, // jaga kompatibilitas
           status: it.status,
-          product: it.product,
+          product: it.product
+            ? {
+                id: it.product.id,
+                title: it.product.title,
+                images: it.product.images,
+              }
+            : null,
           createdAt: it.createdAt,
         })),
         pagination: {
@@ -127,7 +135,7 @@ router.get(
  * @swagger
  * /api/seller/order-items/{id}/status:
  *   patch:
- *     summary: Update status of an order item (my shop only)
+ *     summary: Update status of an order item (seller-only)
  *     tags: [Seller Fulfillment]
  *     security: [ { bearerAuth: [] } ]
  *     parameters:
@@ -143,7 +151,9 @@ router.get(
  *             type: object
  *             required: [status]
  *             properties:
- *               status: { type: string, enum: [NEW, CONFIRMED, SHIPPED, COMPLETED, CANCELLED] }
+ *               status:
+ *                 type: string
+ *                 enum: [CONFIRMED, SHIPPED, CANCELLED]
  *     responses:
  *       200: { description: Updated }
  *       403: { description: Not my shop / invalid transition }
@@ -154,13 +164,14 @@ router.patch(
   authenticateToken,
   [
     param("id").isInt({ min: 1 }),
-    body("status").isIn(VALID_STATUSES).withMessage("Invalid status"),
+    body("status")
+      .isIn(SELLER_UPDATE_STATUSES)
+      .withMessage("Status must be CONFIRMED, SHIPPED or CANCELLED"),
   ],
   handleValidationErrors,
   async (req, res) => {
     try {
-      const userId = req.user.id;
-      const shop = await getMyShopOr403(userId, res);
+      const shop = await getMyShopOr403(req.user.id, res);
       if (!shop) return;
 
       const id = Number(req.params.id);
@@ -173,11 +184,10 @@ router.patch(
       if (!item) return errorResponse(res, "Order item not found", 404);
       if (item.shopId !== shop.id) return errorResponse(res, "Forbidden", 403);
 
-      // aturan transisi
-      if (!canTransit(item.status, to)) {
+      if (!canSellerTransit(item.status, to)) {
         return errorResponse(
           res,
-          `Invalid transition: ${item.status} → ${to}`,
+          `Invalid transition for seller: ${item.status} → ${to}`,
           403
         );
       }
