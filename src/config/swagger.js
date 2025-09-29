@@ -7,7 +7,7 @@ const options = {
     info: {
       title: "E-Commerce API",
       version: "1.0.0",
-      description: "REST API for E-Commerce App (Express + Prisma + Neon)",
+      description: "REST API for E-Commerce App Coding by Henry Rivardo",
     },
     servers: [
       {
