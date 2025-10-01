@@ -1,11 +1,51 @@
+// src/routes/seller.js
 const express = require("express");
 const { body } = require("express-validator");
+const multer = require("multer");
+const streamifier = require("streamifier");
+const cloudinary = require("cloudinary").v2;
+
 const { prisma } = require("../config/database");
 const { authenticateToken } = require("../middleware/auth");
 const { handleValidationErrors } = require("../middleware/validation");
 const { successResponse, errorResponse } = require("../utils/response");
 
 const router = express.Router();
+
+// --- Cloudinary setup ---
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+
+// --- Multer (upload memory buffer) ---
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 }, // max 5MB
+  fileFilter: (_req, file, cb) => {
+    const ok =
+      file.mimetype === "image/png" ||
+      file.mimetype === "image/jpeg" ||
+      file.mimetype === "image/webp";
+    if (!ok) return cb(new Error("Only PNG/JPG/WEBP allowed"));
+    cb(null, true);
+  },
+});
+
+// --- helper upload ke Cloudinary ---
+function uploadBufferToCloudinary(buffer, folder = "ecommerce/shops") {
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      { folder, resource_type: "image" },
+      (err, result) => {
+        if (err) return reject(err);
+        resolve(result);
+      }
+    );
+    streamifier.createReadStream(buffer).pipe(stream);
+  });
+}
 
 const slugify = (s) =>
   s
@@ -32,14 +72,14 @@ const slugify = (s) =>
  *     requestBody:
  *       required: true
  *       content:
- *         application/json:
+ *         multipart/form-data:
  *           schema:
  *             type: object
- *             required: [name, slug]
+ *             required: [name]
  *             properties:
  *               name: { type: string, example: "Gadget Hub" }
  *               slug: { type: string, example: "gadget-hub" }
- *               logo: { type: string, format: uri, example: "https://picsum.photos/200" }
+ *               logo: { type: string, format: binary, description: "Shop logo PNG/JPG/WEBP max 5MB" }
  *               address: { type: string, example: "Jl. Melati No.1, Jakarta" }
  *     responses:
  *       201: { description: Shop created }
@@ -48,39 +88,46 @@ const slugify = (s) =>
 router.post(
   "/activate",
   authenticateToken,
-  [
-    body("name").isLength({ min: 2 }).withMessage("name required"),
-    body("slug").optional().isString().isLength({ min: 2 }),
-    body("logo").optional().isURL().withMessage("logo must be URL"),
-    body("address").optional().isString(),
-  ],
+  upload.single("logo"), // 👈 menangani file logo
+  [body("name").isLength({ min: 2 }).withMessage("name required")],
   handleValidationErrors,
   async (req, res) => {
     try {
       const userId = req.user.id;
-      const { name, slug, logo, address } = req.body;
+      const { name, slug, address } = req.body;
 
-      // 1) user belum punya shop?
+      // sudah punya shop?
       const existing = await prisma.shop.findFirst({
         where: { ownerId: userId },
       });
       if (existing)
         return errorResponse(res, "You already activated seller mode", 400);
 
-      // 2) slug final & harus unik
+      // slug unik
       const finalSlug = slug ? slugify(slug) : slugify(name);
       const slugTaken = await prisma.shop.findUnique({
         where: { slug: finalSlug },
       });
       if (slugTaken) return errorResponse(res, "Slug already used", 400);
 
-      // 3) create shop
+      // upload logo jika ada file
+      let logoUrl = null;
+      if (req.file && req.file.buffer) {
+        try {
+          const result = await uploadBufferToCloudinary(req.file.buffer);
+          logoUrl = result.secure_url;
+        } catch (err) {
+          console.error("Cloudinary upload error:", err);
+          return errorResponse(res, "Failed to upload logo", 400);
+        }
+      }
+
       const shop = await prisma.shop.create({
         data: {
           ownerId: userId,
           name,
           slug: finalSlug,
-          logo: logo || null,
+          logo: logoUrl,
           address: address || null,
           isActive: true,
         },
@@ -106,42 +153,6 @@ router.post(
 /**
  * @swagger
  * /api/seller/shop:
- *   get:
- *     summary: Get my shop profile
- *     tags: [Seller]
- *     security: [ { bearerAuth: [] } ]
- *     responses:
- *       200: { description: OK }
- *       404: { description: Not a seller yet }
- */
-router.get("/shop", authenticateToken, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const shop = await prisma.shop.findFirst({
-      where: { ownerId: userId },
-      select: {
-        id: true,
-        name: true,
-        slug: true,
-        logo: true,
-        address: true,
-        isActive: true,
-        createdAt: true,
-        _count: { select: { products: true, orderItems: true } },
-      },
-    });
-    if (!shop) return errorResponse(res, "You have no shop yet", 404);
-
-    return successResponse(res, shop);
-  } catch (e) {
-    console.error("get shop error:", e);
-    return errorResponse(res);
-  }
-});
-
-/**
- * @swagger
- * /api/seller/shop:
  *   patch:
  *     summary: Update my shop profile
  *     tags: [Seller]
@@ -149,14 +160,14 @@ router.get("/shop", authenticateToken, async (req, res) => {
  *     requestBody:
  *       required: true
  *       content:
- *         application/json:
+ *         multipart/form-data:
  *           schema:
  *             type: object
  *             properties:
- *               name:     { type: string, example: "Gadget Hub Official" }
- *               logo:     { type: string, format: uri, example: "https://picsum.photos/200" }
- *               address:  { type: string, example: "Jl. Melati No.1, Jakarta" }
- *               isActive: { type: boolean, example: true }
+ *               name: { type: string, example: "Gadget Hub Official" }
+ *               logo: { type: string, format: binary, description: "Shop logo PNG/JPG/WEBP max 5MB" }
+ *               address: { type: string }
+ *               isActive: { type: boolean }
  *     responses:
  *       200: { description: Updated }
  *       404: { description: You have no shop yet }
@@ -164,28 +175,31 @@ router.get("/shop", authenticateToken, async (req, res) => {
 router.patch(
   "/shop",
   authenticateToken,
-  [
-    body("name").optional().isLength({ min: 2 }),
-    body("logo").optional().isURL().withMessage("logo must be a valid URL"),
-    body("address").optional().isString(),
-    body("isActive").optional().isBoolean(),
-  ],
-  handleValidationErrors,
+  upload.single("logo"), // 👈 menangani file logo
   async (req, res) => {
     try {
       const userId = req.user.id;
 
-      // pastikan user sudah punya shop
       const shop = await prisma.shop.findFirst({ where: { ownerId: userId } });
       if (!shop) return errorResponse(res, "You have no shop yet", 404);
 
-      // siapkan data update (hanya field yang dikirim)
-      const { name, logo, address, isActive } = req.body;
-      const data = {};
+      const { name, address, isActive } = req.body;
+      let data = {};
+
       if (typeof name !== "undefined") data.name = name;
-      if (typeof logo !== "undefined") data.logo = logo || null;
       if (typeof address !== "undefined") data.address = address || null;
       if (typeof isActive !== "undefined") data.isActive = Boolean(isActive);
+
+      // upload logo jika ada file
+      if (req.file && req.file.buffer) {
+        try {
+          const result = await uploadBufferToCloudinary(req.file.buffer);
+          data.logo = result.secure_url;
+        } catch (err) {
+          console.error("Cloudinary upload error:", err);
+          return errorResponse(res, "Failed to upload logo", 400);
+        }
+      }
 
       const updated = await prisma.shop.update({
         where: { id: shop.id },
@@ -193,7 +207,7 @@ router.patch(
         select: {
           id: true,
           name: true,
-          slug: true, // slug tidak otomatis diubah saat rename, biar link tidak rusak
+          slug: true,
           logo: true,
           address: true,
           isActive: true,
