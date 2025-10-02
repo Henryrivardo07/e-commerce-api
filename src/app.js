@@ -39,7 +39,8 @@ app.use("/api/orders", require("./routes/orders")); // checkout & my orders
 app.use("/api/orders/checkout", require("./routes/orders"));
 app.use("/api/seller/order-items", require("./routes/seller.fulfillment")); // seller order items
 app.use("/api/reviews", require("./routes/reviews")); // product reviews
-
+app.use("/api/stores", require("./routes/products.public"));
+// rute store ada di file yg sama, path relatif "../stores/:id" → ter-mount sebagai /api/stores/:id
 // Health
 app.get("/health", (_req, res) =>
   res.json({ success: true, message: "E-Commerce API is running" })
