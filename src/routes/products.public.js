@@ -139,7 +139,7 @@ router.get(
  * /api/products/{id}:
  *   get:
  *     summary: Get product detail (public)
- *     tags: [Catalog]
+ *     tags: [Products]
  *     parameters:
  *       - in: path
  *         name: id
