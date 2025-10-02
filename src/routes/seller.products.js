@@ -1,15 +1,69 @@
 // src/routes/seller.products.js
 const router = require("express").Router();
 const { body, query, param } = require("express-validator");
+const multer = require("multer");
+const cloudinary = require("cloudinary").v2;
+const streamifier = require("streamifier");
+
 const { prisma } = require("../config/database");
 const { authenticateToken } = require("../middleware/auth");
 const { handleValidationErrors } = require("../middleware/validation");
 const { successResponse, errorResponse } = require("../utils/response");
 
+// ===== Multer: simpan file di memori agar bisa di-stream ke Cloudinary =====
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+  fileFilter: (_req, file, cb) => {
+    const ok =
+      file.mimetype === "image/jpeg" ||
+      file.mimetype === "image/png" ||
+      file.mimetype === "image/webp";
+    if (!ok) return cb(new Error("Only JPG/PNG/WEBP allowed"));
+    cb(null, true);
+  },
+});
+
+// ===== Helper Cloudinary upload (single & multiple) =====
+function uploadToCloudinary(fileBuffer, folder = "products") {
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream({ folder }, (err, res) => {
+      if (err) return reject(err);
+      resolve(res);
+    });
+    streamifier.createReadStream(fileBuffer).pipe(stream);
+  });
+}
+
+async function uploadMany(files = [], folder = "products") {
+  if (!files.length) return [];
+  const results = await Promise.all(
+    files.map((f) =>
+      uploadToCloudinary(f.buffer, folder).then((r) => r.secure_url)
+    )
+  );
+  return results.filter(Boolean);
+}
+
 // util: ambil shop milik user
 async function getMyShop(userId) {
   return prisma.shop.findUnique({ where: { ownerId: userId } });
 }
+
+const makeSlug = (s) =>
+  s
+    .toString()
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/(^-|-$)+/g, "");
+
+/**
+ * @swagger
+ * tags:
+ *   - name: Products
+ *     description: Public catalog & seller products
+ */
 
 /**
  * @swagger
@@ -91,25 +145,32 @@ router.get(
  * @swagger
  * /api/seller/products:
  *   post:
- *     summary: Create a product in my shop
+ *     summary: Create a product in my shop (with file upload)
  *     tags: [Products]
  *     security: [ { bearerAuth: [] } ]
  *     requestBody:
  *       required: true
  *       content:
- *         application/json:
+ *         multipart/form-data:
  *           schema:
  *             type: object
  *             required: [title, price, stock, categoryId]
  *             properties:
- *               title: { type: string }
+ *               title: { type: string, example: "Keyboard Wireless" }
  *               description: { type: string, nullable: true }
- *               price: { type: integer, minimum: 0 }
- *               stock: { type: integer, minimum: 0 }
+ *               price: { type: integer, minimum: 0, example: 150000 }
+ *               stock: { type: integer, minimum: 0, example: 25 }
+ *               categoryId: { type: integer, example: 3 }
  *               images:
  *                 type: array
- *                 items: { type: string }
- *               categoryId: { type: integer }
+ *                 items:
+ *                   type: string
+ *                   format: binary
+ *                 description: Upload 1..n images (JPG/PNG/WEBP, max 5MB/each)
+ *               imagesUrl:
+ *                 type: array
+ *                 items: { type: string, format: uri }
+ *                 description: (opsional) alternatif URL kalau tidak upload file
  *               isActive: { type: boolean, default: true }
  *     responses:
  *       201: { description: Created }
@@ -119,15 +180,16 @@ router.get(
 router.post(
   "/",
   authenticateToken,
+  upload.array("images", 10),
   [
     body("title").isLength({ min: 1 }),
     body("price").isInt({ min: 0 }),
     body("stock").isInt({ min: 0 }),
     body("categoryId").isInt({ min: 1 }),
-    body("images").optional().isArray(),
-    body("images.*").optional().isString(),
-    body("isActive").optional().isBoolean(),
+    body("isActive").optional().isBoolean().toBoolean(),
     body("description").optional().isString(),
+    // imagesUrl as fallback (string or array)
+    body("imagesUrl").optional(),
   ],
   handleValidationErrors,
   async (req, res) => {
@@ -141,21 +203,26 @@ router.post(
         description,
         price,
         stock,
-        images = [],
         categoryId,
         isActive = true,
       } = req.body;
 
-      // slug sederhana
-      const slug =
-        title
-          .toString()
-          .toLowerCase()
-          .trim()
-          .replace(/[^a-z0-9]+/g, "-")
-          .replace(/(^-|-$)+/g, "") +
-        "-" +
-        Date.now();
+      // 1) Upload file ke Cloudinary (kalau ada)
+      const uploadedUrls = await uploadMany(req.files || [], "products");
+
+      // 2) Fallback: imagesUrl (bisa string tunggal atau array)
+      let imagesUrl = [];
+      const raw = req.body.imagesUrl;
+      if (raw) {
+        if (Array.isArray(raw)) imagesUrl = raw.filter(Boolean);
+        else if (typeof raw === "string" && raw.trim())
+          imagesUrl = [raw.trim()];
+      }
+
+      const finalImages = [...uploadedUrls, ...imagesUrl];
+
+      // 3) slug sederhana
+      const slug = `${makeSlug(title)}-${Date.now()}`;
 
       const created = await prisma.product.create({
         data: {
@@ -166,14 +233,17 @@ router.post(
           description: description ?? null,
           price: Number(price),
           stock: Number(stock),
-          images,
+          images: finalImages, // <= simpan URL hasil upload
           isActive: Boolean(isActive),
         },
       });
 
       return successResponse(res, created, "Created", 201);
     } catch (e) {
-      console.error(e);
+      console.error("Create product error:", e);
+      if (String(e?.message || "").includes("Only JPG/PNG/WEBP allowed")) {
+        return errorResponse(res, "Only JPG/PNG/WEBP allowed", 400);
+      }
       return errorResponse(res);
     }
   }
@@ -183,7 +253,7 @@ router.post(
  * @swagger
  * /api/seller/products/{id}:
  *   put:
- *     summary: Update my product
+ *     summary: Update my product (supports file upload)
  *     tags: [Products]
  *     security: [ { bearerAuth: [] } ]
  *     parameters:
@@ -193,7 +263,7 @@ router.post(
  *         schema: { type: integer }
  *     requestBody:
  *       content:
- *         application/json:
+ *         multipart/form-data:
  *           schema:
  *             type: object
  *             properties:
@@ -201,11 +271,18 @@ router.post(
  *               description: { type: string, nullable: true }
  *               price: { type: integer, minimum: 0 }
  *               stock: { type: integer, minimum: 0 }
- *               images:
- *                 type: array
- *                 items: { type: string }
  *               categoryId: { type: integer }
  *               isActive: { type: boolean }
+ *               images:
+ *                 type: array
+ *                 items: { type: string, format: binary }
+ *                 description: Upload baru → akan MENIMPA images lama kecuali merge=true
+ *               imagesUrl:
+ *                 type: array
+ *                 items: { type: string, format: uri }
+ *               merge:
+ *                 type: boolean
+ *                 description: true → gabung dengan gambar lama; false (default) → replace
  *     responses:
  *       200: { description: Updated }
  *       404: { description: Not found }
@@ -213,16 +290,17 @@ router.post(
 router.put(
   "/:id",
   authenticateToken,
+  upload.array("images", 10),
   [
     param("id").isInt({ min: 1 }),
     body("title").optional().isLength({ min: 1 }),
     body("price").optional().isInt({ min: 0 }),
     body("stock").optional().isInt({ min: 0 }),
     body("categoryId").optional().isInt({ min: 1 }),
-    body("images").optional().isArray(),
-    body("images.*").optional().isString(),
-    body("isActive").optional().isBoolean(),
+    body("isActive").optional().isBoolean().toBoolean(),
     body("description").optional().isString(),
+    body("merge").optional().isBoolean().toBoolean(),
+    body("imagesUrl").optional(),
   ],
   handleValidationErrors,
   async (req, res) => {
@@ -236,32 +314,54 @@ router.put(
       if (!existing || existing.shopId !== shop.id)
         return errorResponse(res, "Product not found", 404);
 
+      // Upload baru (jika ada file)
+      const uploadedUrls = await uploadMany(req.files || [], "products");
+
+      // Fallback images url
+      let imagesUrl = [];
+      const raw = req.body.imagesUrl;
+      if (raw) {
+        if (Array.isArray(raw)) imagesUrl = raw.filter(Boolean);
+        else if (typeof raw === "string" && raw.trim())
+          imagesUrl = [raw.trim()];
+      }
+
+      // Tentukan final images
+      const merge = Boolean(req.body.merge);
+      let finalImages = existing.images || [];
+      const newImages = [...uploadedUrls, ...imagesUrl];
+
+      if (newImages.length) {
+        finalImages = merge ? [...finalImages, ...newImages] : newImages;
+      } // jika tidak ada input, biarkan images lama
+
+      const data = {
+        ...(req.body.title && { title: req.body.title }),
+        ...(req.body.description !== undefined && {
+          description: req.body.description,
+        }),
+        ...(req.body.price !== undefined && { price: Number(req.body.price) }),
+        ...(req.body.stock !== undefined && { stock: Number(req.body.stock) }),
+        ...(req.body.categoryId !== undefined && {
+          categoryId: Number(req.body.categoryId),
+        }),
+        ...(req.body.isActive !== undefined && {
+          isActive: Boolean(req.body.isActive),
+        }),
+        ...(newImages.length ? { images: finalImages } : {}), // update images hanya kalau ada input baru
+      };
+
       const updated = await prisma.product.update({
         where: { id },
-        data: {
-          ...(req.body.title && { title: req.body.title }),
-          ...(req.body.description !== undefined && {
-            description: req.body.description,
-          }),
-          ...(req.body.price !== undefined && {
-            price: Number(req.body.price),
-          }),
-          ...(req.body.stock !== undefined && {
-            stock: Number(req.body.stock),
-          }),
-          ...(req.body.categoryId !== undefined && {
-            categoryId: Number(req.body.categoryId),
-          }),
-          ...(req.body.images && { images: req.body.images }),
-          ...(req.body.isActive !== undefined && {
-            isActive: Boolean(req.body.isActive),
-          }),
-        },
+        data,
       });
 
       return successResponse(res, updated, "Updated");
     } catch (e) {
-      console.error(e);
+      console.error("Update product error:", e);
+      if (String(e?.message || "").includes("Only JPG/PNG/WEBP allowed")) {
+        return errorResponse(res, "Only JPG/PNG/WEBP allowed", 400);
+      }
       return errorResponse(res);
     }
   }
