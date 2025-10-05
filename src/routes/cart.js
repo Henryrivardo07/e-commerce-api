@@ -18,7 +18,7 @@ async function getOrCreateCart(userId) {
  * @swagger
  * /api/cart:
  *   get:
- *     summary: Get my cart (items + subtotal + grandTotal)
+ *     summary: Get my cart (items grouped by shop + grandTotal)
  *     tags: [Cart]
  *     security: [ { bearerAuth: [] } ]
  *     responses:
@@ -41,23 +41,64 @@ router.get("/", authenticateToken, async (req, res) => {
             images: true,
             isActive: true,
             stock: true,
+            // [NEW] ikutkan info toko untuk grouping FE
+            shop: { select: { id: true, name: true, slug: true } },
           },
         },
       },
       orderBy: { id: "desc" },
     });
 
+    // [UNCHANGED] daftar flat items (kompatibel versi lama)
     const mapped = items.map((it) => ({
       id: it.id,
       productId: it.productId,
       qty: it.qty,
       priceSnapshot: it.priceSnapshot,
       subtotal: it.qty * it.priceSnapshot,
-      product: it.product,
+      product: it.product, // sekarang product sudah mengandung product.shop
     }));
     const grandTotal = mapped.reduce((s, x) => s + x.subtotal, 0);
 
-    return successResponse(res, { cartId: cart.id, items: mapped, grandTotal });
+    // [NEW] bentuk groups per toko (untuk UI seperti desainmu)
+    const groupsMap = new Map(); // shopId -> { shop, items, subtotal }
+    for (const it of items) {
+      // antisipasi produk non-aktif/null tetap aman (sudah dicek saat add/update)
+      const shop = it.product?.shop;
+      const shopId = shop?.id ?? 0;
+
+      if (!groupsMap.has(shopId)) {
+        groupsMap.set(shopId, { shop, items: [], subtotal: 0 });
+      }
+      const g = groupsMap.get(shopId);
+
+      const sub = it.qty * it.priceSnapshot;
+      g.items.push({
+        id: it.id,
+        productId: it.productId,
+        qty: it.qty,
+        priceSnapshot: it.priceSnapshot,
+        subtotal: sub,
+        product: {
+          id: it.product.id,
+          title: it.product.title,
+          images: it.product.images,
+          price: it.product.price,
+          isActive: it.product.isActive,
+          stock: it.product.stock,
+        },
+      });
+      g.subtotal += sub;
+    }
+    const groups = Array.from(groupsMap.values());
+
+    // [CHANGED] kirim items (flat) + groups (per toko) + grandTotal
+    return successResponse(res, {
+      cartId: cart.id,
+      items: mapped,
+      groups,
+      grandTotal,
+    });
   } catch (e) {
     console.error(e);
     return errorResponse(res);

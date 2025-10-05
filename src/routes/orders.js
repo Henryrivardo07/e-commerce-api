@@ -38,7 +38,7 @@ const buildOrderResponse = (order) => ({
  * @swagger
  * /api/orders/checkout:
  *   post:
- *     summary: Checkout cart -> create Order & OrderItems (payment mock=PAID)
+ *     summary: Checkout cart -> create Orders per shop (payment mock=PAID)
  *     tags: [Orders]
  *     security: [ { bearerAuth: [] } ]
  *     requestBody:
@@ -51,7 +51,7 @@ const buildOrderResponse = (order) => ({
  *             properties:
  *               address: { type: string, example: "Jl. Sudirman No. 1, Jakarta" }
  *     responses:
- *       200: { description: Order created }
+ *       200: { description: Orders created (one per shop) }
  *       400: { description: Cart empty / stock invalid }
  *       401: { description: Unauthorized }
  */
@@ -106,61 +106,75 @@ router.post(
         }
       }
 
-      // 3) Hitung total berdasarkan priceSnapshot (sesuai kontrak cart)
-      const totalAmount = items.reduce(
-        (sum, x) => sum + x.qty * x.priceSnapshot,
-        0
-      );
+      // [NEW] 3) Group items by shopId
+      const groups = new Map(); // shopId -> items[]
+      for (const it of items) {
+        const key = it.product.shopId;
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(it);
+      }
 
-      // Helper kode order sederhana (YYYYMMDD-xxxxx)
-      const code = `ORD-${Date.now().toString().slice(-8)}`;
+      // [CHANGED] 4) Transaksi: buat MULTI ORDER (1 per toko), update stok, kosongkan cart
+      const createdOrders = await prisma.$transaction(async (tx) => {
+        const results = [];
 
-      // 4) Transaksi: buat order + orderItems, update stok, kosongkan cart
-      const created = await prisma.$transaction(async (tx) => {
-        const order = await tx.order.create({
-          data: {
-            userId,
-            code,
-            paymentStatus: "PAID", // mock payment
-            totalAmount,
-            addressSnap: String(address), // <- STRING biasa
-          },
-        });
+        for (const [shopId, groupItems] of groups.entries()) {
+          // total per toko berdasarkan priceSnapshot (sesuai kontrak cart)
+          const totalAmount = groupItems.reduce(
+            (sum, x) => sum + x.qty * x.priceSnapshot,
+            0
+          );
 
-        // Buat item per cartItem
-        for (const it of items) {
-          await tx.orderItem.create({
+          // helper kode order: ORD-xxxxxxxx-<shopId>
+          const code = `ORD-${Date.now().toString().slice(-8)}-${shopId}`;
+
+          const order = await tx.order.create({
             data: {
-              orderId: order.id,
-              productId: it.productId,
-              shopId: it.product.shopId,
-              qty: it.qty,
-              status: "NEW",
-              titleSnap: it.product.title,
-              // imageSnap: it.product.images?.[0] ?? null,
-              priceSnap: it.product.price,
+              userId,
+              code,
+              paymentStatus: "PAID", // mock payment
+              totalAmount,
+              addressSnap: String(address), // simpan sebagai string sederhana
             },
           });
 
-          // Decrement stok real-time
-          await tx.product.update({
-            where: { id: it.productId },
-            data: {
-              stock: { decrement: it.qty },
-              soldCount: { increment: it.qty },
-            },
-          });
+          // Buat item per toko
+          for (const it of groupItems) {
+            await tx.orderItem.create({
+              data: {
+                orderId: order.id,
+                productId: it.productId,
+                shopId, // penting: kepemilikan toko
+                qty: it.qty,
+                status: "NEW",
+                titleSnap: it.product.title,
+                // imageSnap: it.product.images?.[0] ?? null,
+                priceSnap: it.product.price, // snapshot harga saat checkout
+              },
+            });
+
+            // Decrement stok real-time
+            await tx.product.update({
+              where: { id: it.productId },
+              data: {
+                stock: { decrement: it.qty },
+                soldCount: { increment: it.qty },
+              },
+            });
+          }
+
+          results.push(order);
         }
 
-        // Kosongkan cart
+        // Kosongkan cart setelah semua order terbentuk
         await tx.cartItem.deleteMany({ where: { cartId: cart.id } });
 
-        return order;
+        return results;
       });
 
-      // Fetch detail order buat response
-      const full = await prisma.order.findUnique({
-        where: { id: created.id },
+      // [CHANGED] 5) Fetch detail semua order yang baru dibuat
+      const fullOrders = await prisma.order.findMany({
+        where: { id: { in: createdOrders.map((o) => o.id) } },
         include: {
           items: {
             include: {
@@ -169,9 +183,18 @@ router.post(
             },
           },
         },
+        orderBy: { id: "asc" },
       });
 
-      return successResponse(res, buildOrderResponse(full), "Checkout success");
+      // [CHANGED] 6) Kembalikan array orders (bukan single)
+      return successResponse(
+        res,
+        {
+          count: fullOrders.length,
+          orders: fullOrders.map(buildOrderResponse),
+        },
+        "Checkout success"
+      );
     } catch (e) {
       console.error("Checkout error:", e);
       return errorResponse(res, "Checkout failed");
