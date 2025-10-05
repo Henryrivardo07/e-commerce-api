@@ -36,7 +36,6 @@ app.use("/api/products", require("./routes/products.public")); // public catalog
 app.use("/api/seller/products", require("./routes/seller.products")); // seller's products CRUD
 app.use("/api/cart", require("./routes/cart")); // user cart
 app.use("/api/orders", require("./routes/orders")); // checkout & my orders
-app.use("/api/orders/checkout", require("./routes/orders"));
 app.use("/api/seller/order-items", require("./routes/seller.fulfillment")); // seller order items
 app.use("/api/reviews", require("./routes/reviews")); // product reviews
 app.use("/api/stores", require("./routes/products.public"));
