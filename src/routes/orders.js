@@ -443,4 +443,149 @@ router.patch(
   }
 );
 
+/**
+ * @swagger
+ * /api/orders/{id}/cancel:
+ *   patch:
+ *     summary: Buyer cancels the whole order (per shop)
+ *     description: >
+ *       Batalkan **seluruh order** (1 toko). Hanya jika semua item dalam order belum dikirim
+ *       (status item: NEW/CONFIRMED/CANCELLED; tidak boleh ada SHIPPED/COMPLETED).
+ *       Item yang NEW/CONFIRMED akan diubah ke CANCELLED, stok dikembalikan, dan order di-set REFUNDED (mock).
+ *     tags: [Orders]
+ *     security: [ { bearerAuth: [] } ]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: integer }
+ *     requestBody:
+ *       required: false
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               reason: { type: string, example: "Change of mind" }
+ *     responses:
+ *       200: { description: Cancelled }
+ *       403: { description: Forbidden / invalid state }
+ *       404: { description: Order not found }
+ */
+router.patch(
+  "/:id/cancel",
+  authenticateToken,
+  [
+    param("id").isInt({ min: 1 }),
+    body("reason").optional().isString().isLength({ max: 500 }),
+  ],
+  handleValidationErrors,
+  async (req, res) => {
+    try {
+      const userId = req.user.id;
+      const orderId = Number(req.params.id);
+      const { reason } = req.body;
+
+      // [CHECK] Ambil order + item untuk verifikasi kepemilikan & status
+      const order = await prisma.order.findUnique({
+        where: { id: orderId },
+        include: {
+          items: {
+            select: {
+              id: true,
+              productId: true,
+              qty: true,
+              status: true,
+            },
+          },
+        },
+      });
+      if (!order || order.userId !== userId) {
+        return errorResponse(res, "Order not found", 404);
+      }
+
+      // [RULE] Tidak boleh ada item yang sudah dikirim/selesai
+      const hasShippedOrCompleted = order.items.some(
+        (it) => it.status === "SHIPPED" || it.status === "COMPLETED"
+      );
+      if (hasShippedOrCompleted) {
+        return errorResponse(
+          res,
+          "Some items have been shipped or completed. This order can no longer be cancelled.",
+          403
+        );
+      }
+
+      // Item yang akan di-cancel (NEW/CONFIRMED). Yang sudah CANCELLED diabaikan.
+      const cancellable = order.items.filter(
+        (it) => it.status === "NEW" || it.status === "CONFIRMED"
+      );
+      if (cancellable.length === 0) {
+        // semua item mungkin sudah CANCELLED sebelumnya
+        // tetap set order REFUNDED agar konsisten
+        await prisma.order.update({
+          where: { id: orderId },
+          data: { paymentStatus: "REFUNDED" },
+        });
+        return successResponse(
+          res,
+          { orderId, cancelledItems: 0 },
+          "Order already cancelled"
+        );
+      }
+
+      // [TX] batalkan item, kembalikan stok, set order REFUNDED
+      const result = await prisma.$transaction(async (tx) => {
+        // 1) Batalkan semua item yang masih NEW/CONFIRMED
+        const updatedItems = [];
+        for (const it of cancellable) {
+          const upd = await tx.orderItem.update({
+            where: { id: it.id },
+            data: {
+              status: "CANCELLED",
+              // Kalau punya kolom alasan, isi di sini:
+              // cancelReason: reason ?? null,
+            },
+          });
+          updatedItems.push(upd);
+
+          // 2) Kembalikan stok & koreksi soldCount
+          await tx.product.update({
+            where: { id: it.productId },
+            data: {
+              stock: { increment: it.qty },
+              soldCount: { decrement: it.qty },
+            },
+          });
+        }
+
+        // 3) Set order REFUNDED (mock). Bisa juga hitung ulang totalAmount jika mau.
+        const updOrder = await tx.order.update({
+          where: { id: orderId },
+          data: {
+            paymentStatus: "REFUNDED",
+            // Optional: jika kamu ingin totalAmount ikut 0 saat semuanya cancel:
+            // totalAmount: 0,
+          },
+        });
+
+        return { updatedItems, updOrder };
+      });
+
+      return successResponse(
+        res,
+        {
+          orderId,
+          paymentStatus: "REFUNDED",
+          cancelledItems: result.updatedItems.length,
+        },
+        "Order cancelled"
+      );
+    } catch (e) {
+      console.error("Buyer cancel order error:", e);
+      return errorResponse(res);
+    }
+  }
+);
+
 module.exports = router;
