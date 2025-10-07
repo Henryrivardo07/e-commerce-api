@@ -1,3 +1,4 @@
+// src/routes/reviews.js
 const router = require("express").Router();
 const { body, param, query } = require("express-validator");
 const { prisma } = require("../config/database");
@@ -6,9 +7,13 @@ const { handleValidationErrors } = require("../middleware/validation");
 const { successResponse, errorResponse } = require("../utils/response");
 
 /**
- * Helper: hitung & simpan ulang agregat rating produk
- * NOTE: sesuaikan 'rating' => jika di schema kamu pakai 'avgRating', ganti keynya.
+ * @swagger
+ * tags:
+ *   - name: Reviews
+ *     description: Book/write/delete product reviews
  */
+
+/** Helper: hitung & simpan ulang agregat rating produk */
 async function recalcProductRating(productId) {
   const agg = await prisma.review.aggregate({
     where: { productId },
@@ -18,16 +23,9 @@ async function recalcProductRating(productId) {
   const avg = Number((agg._avg.star || 0).toFixed(2));
   await prisma.product.update({
     where: { id: productId },
-    data: { rating: avg, reviewCount: agg._count }, // ganti 'rating' -> 'avgRating' kalau fieldmu bernama avgRating
+    data: { rating: avg, reviewCount: agg._count },
   });
 }
-
-/**
- * @swagger
- * tags:
- *   - name: Reviews
- *     description: Book/write/delete product reviews
- */
 
 /**
  * @swagger
@@ -67,16 +65,16 @@ router.post(
       const { productId, star, comment } = req.body;
       const pid = Number(productId);
 
-      // 1) pastikan produknya ada
+      // pastikan produknya ada
       const product = await prisma.product.findUnique({ where: { id: pid } });
       if (!product) return errorResponse(res, "Product not found", 404);
 
-      // 2) business rule: user pernah membeli & item COMPLETED
+      // rule: user pernah membeli & item COMPLETED
       const completedItem = await prisma.orderItem.findFirst({
         where: {
           productId: pid,
           status: "COMPLETED",
-          order: { userId }, // relasi ke order -> hanya order milik user
+          order: { userId }, // hanya order milik user
         },
         select: { id: true },
       });
@@ -88,8 +86,7 @@ router.post(
         );
       }
 
-      // 3) upsert 1-review-per-(user, product)
-      // pastikan schema punya @@unique([userId, productId]) di Review
+      // upsert 1-review-per-(user, product)
       const existing = await prisma.review.findFirst({
         where: { userId, productId: pid },
         select: { id: true },
@@ -107,7 +104,7 @@ router.post(
         });
       }
 
-      // 4) update agregat rating produk
+      // update agregat rating produk
       await recalcProductRating(pid);
 
       return successResponse(res, { review }, "Review saved");
@@ -181,6 +178,181 @@ router.get(
       });
     } catch (e) {
       console.error("List product reviews error:", e);
+      return errorResponse(res);
+    }
+  }
+);
+
+/**
+ * @swagger
+ * /api/reviews/my:
+ *   get:
+ *     summary: List all reviews I've written (with product info)
+ *     description: Menampilkan semua review milik user yang sedang login.
+ *     tags: [Reviews]
+ *     security: [ { bearerAuth: [] } ]
+ *     parameters:
+ *       - in: query
+ *         name: page
+ *         schema: { type: integer, default: 1 }
+ *       - in: query
+ *         name: limit
+ *         schema: { type: integer, default: 10, maximum: 50 }
+ *       - in: query
+ *         name: star
+ *         schema: { type: integer, minimum: 1, maximum: 5 }
+ *       - in: query
+ *         name: q
+ *         schema: { type: string, description: "search by product title" }
+ *     responses:
+ *       200: { description: OK }
+ *       401: { description: Unauthorized }
+ */
+// [NEW] list semua review milik user
+router.get(
+  "/my",
+  authenticateToken,
+  [
+    query("page").optional().isInt({ min: 1 }),
+    query("limit").optional().isInt({ min: 1, max: 50 }),
+    query("star").optional().isInt({ min: 1, max: 5 }),
+    query("q").optional().isString(),
+  ],
+  handleValidationErrors,
+  async (req, res) => {
+    try {
+      const userId = req.user.id;
+      const { page = 1, limit = 10, star, q } = req.query;
+
+      const where = {
+        userId,
+        ...(star && { star: Number(star) }),
+        ...(q && {
+          product: {
+            title: { contains: q, mode: "insensitive" },
+          },
+        }),
+      };
+
+      const [items, total] = await Promise.all([
+        prisma.review.findMany({
+          where,
+          orderBy: { createdAt: "desc" },
+          skip: (Number(page) - 1) * Number(limit),
+          take: Number(limit),
+          include: {
+            product: {
+              select: {
+                id: true,
+                title: true,
+                images: true,
+                price: true,
+                slug: true,
+                shop: {
+                  select: { id: true, name: true, slug: true, logo: true },
+                },
+              },
+            },
+          },
+        }),
+        prisma.review.count({ where }),
+      ]);
+
+      return successResponse(res, {
+        reviews: items,
+        pagination: {
+          page: Number(page),
+          limit: Number(limit),
+          total,
+          totalPages: Math.ceil(total / Number(limit)),
+        },
+      });
+    } catch (e) {
+      console.error("List my reviews error:", e);
+      return errorResponse(res);
+    }
+  }
+);
+
+/**
+ * @swagger
+ * /api/reviews/my/eligible:
+ *   get:
+ *     summary: List products I've completed purchasing but not reviewed yet
+ *     description: Daftar produk dari order item **COMPLETED** milik user yang belum memiliki review. Cocok untuk halaman "Tulis Review".
+ *     tags: [Reviews]
+ *     security: [ { bearerAuth: [] } ]
+ *     parameters:
+ *       - in: query
+ *         name: page
+ *         schema: { type: integer, default: 1 }
+ *       - in: query
+ *         name: limit
+ *         schema: { type: integer, default: 10, maximum: 50 }
+ *     responses:
+ *       200: { description: OK }
+ *       401: { description: Unauthorized }
+ */
+// [NEW - BONUS] list produk eligible direview (sudah completed tapi belum ada review)
+router.get(
+  "/my/eligible",
+  authenticateToken,
+  [
+    query("page").optional().isInt({ min: 1 }),
+    query("limit").optional().isInt({ min: 1, max: 50 }),
+  ],
+  handleValidationErrors,
+  async (req, res) => {
+    try {
+      const userId = req.user.id;
+      const { page = 1, limit = 10 } = req.query;
+
+      // ambil productId unik dari orderItem COMPLETED milik user
+      const completed = await prisma.orderItem.findMany({
+        where: { status: "COMPLETED", order: { userId } },
+        distinct: ["productId"],
+        select: {
+          productId: true,
+          product: {
+            select: {
+              id: true,
+              title: true,
+              images: true,
+              price: true,
+              slug: true,
+              shop: {
+                select: { id: true, name: true, slug: true, logo: true },
+              },
+            },
+          },
+        },
+        orderBy: { id: "desc" },
+      });
+
+      const reviewed = await prisma.review.findMany({
+        where: { userId },
+        select: { productId: true },
+      });
+      const reviewedSet = new Set(reviewed.map((r) => r.productId));
+
+      const pending = completed.filter((c) => !reviewedSet.has(c.productId));
+
+      // pagination manual (karena array hasil filter)
+      const start = (Number(page) - 1) * Number(limit);
+      const end = start + Number(limit);
+      const slice = pending.slice(start, end);
+
+      return successResponse(res, {
+        items: slice.map((x) => x.product),
+        pagination: {
+          page: Number(page),
+          limit: Number(limit),
+          total: pending.length,
+          totalPages: Math.ceil(pending.length / Number(limit)),
+        },
+      });
+    } catch (e) {
+      console.error("List eligible-for-review error:", e);
       return errorResponse(res);
     }
   }
