@@ -6,39 +6,66 @@ const { authenticateToken } = require("../middleware/auth");
 const { handleValidationErrors } = require("../middleware/validation");
 const { successResponse, errorResponse } = require("../utils/response");
 
-// util: format order response ringkas
-const buildOrderResponse = (order) => ({
-  id: order.id,
-  code: order.code,
-  paymentStatus: order.paymentStatus,
-  address: order.addressSnap?.address ?? order.addressSnap ?? null, // Json atau String
-  totalAmount: order.totalAmount,
-  createdAt: order.createdAt,
-  items: order.items?.map((it) => ({
-    id: it.id,
-    productId: it.productId,
-    shopId: it.shopId,
-    qty: it.qty,
-    priceSnapshot: it.priceSnap,
-    status: it.status,
-    product: it.product
-      ? {
-          id: it.product.id,
-          title: it.product.title,
-          images: it.product.images,
-        }
-      : undefined,
-    shop: it.shop
-      ? { id: it.shop.id, name: it.shop.name, slug: it.shop.slug }
-      : undefined,
-  })),
-});
+/**
+ * @swagger
+ * tags:
+ *   - name: Orders
+ *     description: Checkout & buyer orders
+ */
+
+// [CHANGED] util: format order response -> parse addressSnap string → object
+const buildOrderResponse = (order) => {
+  let addressDetail = null;
+  const snap = order.addressSnap;
+
+  if (snap && typeof snap === "object") {
+    addressDetail = snap;
+  } else if (typeof snap === "string") {
+    try {
+      addressDetail = JSON.parse(snap);
+    } catch {
+      // fallback legacy (alamat disimpan sebagai string polos)
+      addressDetail = { address: snap };
+    }
+  }
+
+  return {
+    id: order.id,
+    code: order.code,
+    paymentStatus: order.paymentStatus,
+    // [KEEP] legacy (string address saja)
+    address: addressDetail?.address ?? null,
+    // [NEW] semua field alamat + shippingMethod
+    addressDetail, // {name, phone, city, postalCode, address, shippingMethod}
+    totalAmount: order.totalAmount,
+    createdAt: order.createdAt,
+    items: order.items?.map((it) => ({
+      id: it.id,
+      productId: it.productId,
+      shopId: it.shopId,
+      qty: it.qty,
+      priceSnapshot: it.priceSnap,
+      status: it.status,
+      product: it.product
+        ? {
+            id: it.product.id,
+            title: it.product.title,
+            images: it.product.images,
+          }
+        : undefined,
+      shop: it.shop
+        ? { id: it.shop.id, name: it.shop.name, slug: it.shop.slug }
+        : undefined,
+    })),
+  };
+};
 
 /**
  * @swagger
  * /api/orders/checkout:
  *   post:
  *     summary: Checkout cart -> create Orders per shop (payment mock=PAID)
+ *     description: Membuat **satu order per toko** dari isi cart. Menyimpan snapshot alamat lengkap & shipping method di setiap order.
  *     tags: [Orders]
  *     security: [ { bearerAuth: [] } ]
  *     requestBody:
@@ -49,20 +76,43 @@ const buildOrderResponse = (order) => ({
  *             type: object
  *             required: [address]
  *             properties:
- *               address: { type: string, example: "Jl. Sudirman No. 1, Jakarta" }
+ *               address:
+ *                 type: object
+ *                 required: [name, phone, city, postalCode, address]
+ *                 properties:
+ *                   name:       { type: string, example: "John Doe" }
+ *                   phone:      { type: string, example: "081234567890" }
+ *                   city:       { type: string, example: "Jakarta" }
+ *                   postalCode: { type: string, example: "11480" }
+ *                   address:    { type: string, example: "Jl. Sudirman No. 1" }
+ *               shippingMethod:
+ *                 type: string
+ *                 example: "JNE REG"
+ *                 description: Metode pengiriman (mock) yang akan disimpan di snapshot order.
  *     responses:
- *       200: { description: Orders created (one per shop) }
- *       400: { description: Cart empty / stock invalid }
- *       401: { description: Unauthorized }
+ *       200:
+ *         description: Orders created (one per shop)
+ *       400:
+ *         description: Cart empty / stock invalid
+ *       401:
+ *         description: Unauthorized
  */
 router.post(
   "/checkout",
   authenticateToken,
-  [body("address").isString().trim().isLength({ min: 5 })],
+  [
+    // [NEW] validasi nested address fields
+    body("address.name").isString().trim().isLength({ min: 2 }),
+    body("address.phone").isString().trim().isLength({ min: 6 }),
+    body("address.city").isString().trim().isLength({ min: 2 }),
+    body("address.postalCode").isString().trim().isLength({ min: 3 }),
+    body("address.address").isString().trim().isLength({ min: 5 }),
+    body("shippingMethod").optional().isString().trim().isLength({ min: 2 }),
+  ],
   handleValidationErrors,
   async (req, res) => {
     const userId = req.user.id;
-    const { address } = req.body;
+    const { address, shippingMethod } = req.body;
 
     try {
       // 1) Ambil cart + item beserta product & shop
@@ -85,10 +135,9 @@ router.post(
           },
         },
       });
-
       if (items.length === 0) return errorResponse(res, "Cart is empty", 400);
 
-      // 2) Validasi stok & ketersediaan terkini
+      // 2) Validasi stok & availability terkini
       for (const it of items) {
         if (!it.product || !it.product.isActive) {
           return errorResponse(
@@ -106,7 +155,7 @@ router.post(
         }
       }
 
-      // [NEW] 3) Group items by shopId
+      // 3) Group items by shopId
       const groups = new Map(); // shopId -> items[]
       for (const it of items) {
         const key = it.product.shopId;
@@ -114,18 +163,21 @@ router.post(
         groups.get(key).push(it);
       }
 
-      // [CHANGED] 4) Transaksi: buat MULTI ORDER (1 per toko), update stok, kosongkan cart
+      // [NEW] gabungkan shippingMethod ke snapshot alamat agar tersalin ke setiap order
+      const addressSnapObj = {
+        ...address,
+        shippingMethod: shippingMethod ?? null,
+      };
+
+      // 4) Transaksi: MULTI ORDER (1 per toko), update stok, kosongkan cart
       const createdOrders = await prisma.$transaction(async (tx) => {
         const results = [];
 
         for (const [shopId, groupItems] of groups.entries()) {
-          // total per toko berdasarkan priceSnapshot (sesuai kontrak cart)
           const totalAmount = groupItems.reduce(
             (sum, x) => sum + x.qty * x.priceSnapshot,
             0
           );
-
-          // helper kode order: ORD-xxxxxxxx-<shopId>
           const code = `ORD-${Date.now().toString().slice(-8)}-${shopId}`;
 
           const order = await tx.order.create({
@@ -134,7 +186,8 @@ router.post(
               code,
               paymentStatus: "PAID", // mock payment
               totalAmount,
-              addressSnap: String(address), // simpan sebagai string sederhana
+              // [CHANGED] kolom DB string → simpan string JSON
+              addressSnap: JSON.stringify(addressSnapObj),
             },
           });
 
@@ -144,16 +197,15 @@ router.post(
               data: {
                 orderId: order.id,
                 productId: it.productId,
-                shopId, // penting: kepemilikan toko
+                shopId,
                 qty: it.qty,
                 status: "NEW",
                 titleSnap: it.product.title,
-                // imageSnap: it.product.images?.[0] ?? null,
                 priceSnap: it.product.price, // snapshot harga saat checkout
               },
             });
 
-            // Decrement stok real-time
+            // Decrement stok
             await tx.product.update({
               where: { id: it.productId },
               data: {
@@ -172,7 +224,7 @@ router.post(
         return results;
       });
 
-      // [CHANGED] 5) Fetch detail semua order yang baru dibuat
+      // 5) Ambil detail order untuk response
       const fullOrders = await prisma.order.findMany({
         where: { id: { in: createdOrders.map((o) => o.id) } },
         include: {
@@ -186,7 +238,6 @@ router.post(
         orderBy: { id: "asc" },
       });
 
-      // [CHANGED] 6) Kembalikan array orders (bukan single)
       return successResponse(
         res,
         {
@@ -218,7 +269,9 @@ router.post(
  *         schema: { type: integer, default: 10, maximum: 50 }
  *       - in: query
  *         name: paymentStatus
- *         schema: { type: string, enum: [PENDING, PAID, FAILED, REFUNDED] }
+ *         schema:
+ *           type: string
+ *           enum: [PENDING, PAID, FAILED, REFUNDED]
  *     responses:
  *       200: { description: OK }
  */

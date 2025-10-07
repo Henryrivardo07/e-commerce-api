@@ -6,6 +6,13 @@ const { authenticateToken } = require("../middleware/auth");
 const { handleValidationErrors } = require("../middleware/validation");
 const { successResponse, errorResponse } = require("../utils/response");
 
+/**
+ * @swagger
+ * tags:
+ *   - name: Seller Fulfillment
+ *     description: Seller order items handling
+ */
+
 /** ===== Helper: dapatkan shop milik user (seller) ===== */
 async function getMyShopOr403(userId, res) {
   const shop = await prisma.shop.findUnique({ where: { ownerId: userId } });
@@ -35,12 +42,20 @@ function canSellerTransit(from, to) {
   return false;
 }
 
-/**
- * @swagger
- * tags:
- *   - name: Seller Fulfillment
- *     description: Manage order items for your shop (seller-only)
- */
+/** [CHANGED] Parser aman untuk addressSnap (bisa String JSON / Object / String biasa) */
+function parseAddressSnap(snap) {
+  if (!snap) return null;
+  if (typeof snap === "object") return snap;
+  if (typeof snap === "string") {
+    try {
+      const obj = JSON.parse(snap);
+      return typeof obj === "object" && obj ? obj : { address: snap };
+    } catch {
+      return { address: snap };
+    }
+  }
+  return null;
+}
 
 /**
  * @swagger
@@ -52,9 +67,7 @@ function canSellerTransit(from, to) {
  *     parameters:
  *       - in: query
  *         name: status
- *         schema:
- *           type: string
- *           enum: [NEW, CONFIRMED, SHIPPED, CANCELLED]
+ *         schema: { type: string, enum: [NEW, CONFIRMED, SHIPPED, CANCELLED] }
  *       - in: query
  *         name: page
  *         schema: { type: integer, default: 1 }
@@ -92,7 +105,14 @@ router.get(
           include: {
             product: { select: { id: true, title: true, images: true } },
             order: {
-              select: { id: true, code: true, userId: true, createdAt: true },
+              // [CHANGED] ikutkan addressSnap (akan diparse ke buyer/shipping)
+              select: {
+                id: true,
+                code: true,
+                userId: true,
+                createdAt: true,
+                addressSnap: true, // string JSON / object / string legacy
+              },
             },
           },
         }),
@@ -100,23 +120,42 @@ router.get(
       ]);
 
       return successResponse(res, {
-        items: rows.map((it) => ({
-          id: it.id,
-          orderId: it.orderId,
-          code: it.order?.code,
-          productId: it.productId,
-          qty: it.qty,
-          priceSnapshot: it.priceSnapshot ?? it.priceSnap, // jaga kompatibilitas
-          status: it.status,
-          product: it.product
-            ? {
-                id: it.product.id,
-                title: it.product.title,
-                images: it.product.images,
-              }
-            : null,
-          createdAt: it.createdAt,
-        })),
+        items: rows.map((it) => {
+          const addressDetail = parseAddressSnap(it.order?.addressSnap); // [CHANGED]
+
+          return {
+            id: it.id,
+            orderId: it.orderId,
+            code: it.order?.code,
+            productId: it.productId,
+            qty: it.qty,
+            priceSnapshot: it.priceSnapshot ?? it.priceSnap, // jaga kompat
+            status: it.status,
+            product: it.product
+              ? {
+                  id: it.product.id,
+                  title: it.product.title,
+                  images: it.product.images,
+                }
+              : null,
+            createdAt: it.createdAt,
+            // [NEW] info untuk UI seller (panel kanan/section address)
+            buyer: addressDetail
+              ? {
+                  name: addressDetail.name ?? null,
+                  phone: addressDetail.phone ?? null,
+                }
+              : null,
+            shipping: addressDetail
+              ? {
+                  method: addressDetail.shippingMethod ?? null,
+                  address: addressDetail.address ?? null,
+                  city: addressDetail.city ?? null,
+                  postalCode: addressDetail.postalCode ?? null,
+                }
+              : null,
+          };
+        }),
         pagination: {
           page: Number(page),
           limit: Number(limit),
@@ -133,9 +172,98 @@ router.get(
 
 /**
  * @swagger
+ * /api/seller/order-items/{id}:
+ *   get:
+ *     summary: Get a single order item of my shop (with buyer & shipping)
+ *     tags: [Seller Fulfillment]
+ *     security: [ { bearerAuth: [] } ]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: integer }
+ *     responses:
+ *       200: { description: OK }
+ *       403: { description: Not my shop }
+ *       404: { description: Not found }
+ */
+router.get(
+  "/:id",
+  authenticateToken,
+  [param("id").isInt({ min: 1 })],
+  handleValidationErrors,
+  async (req, res) => {
+    try {
+      const shop = await getMyShopOr403(req.user.id, res);
+      if (!shop) return;
+
+      const id = Number(req.params.id);
+
+      const it = await prisma.orderItem.findUnique({
+        where: { id },
+        include: {
+          product: { select: { id: true, title: true, images: true } },
+          order: {
+            select: {
+              id: true,
+              code: true,
+              userId: true,
+              createdAt: true,
+              addressSnap: true,
+            },
+          },
+        },
+      });
+
+      if (!it) return errorResponse(res, "Order item not found", 404);
+      if (it.shopId !== shop.id) return errorResponse(res, "Forbidden", 403);
+
+      const addressDetail = parseAddressSnap(it.order?.addressSnap); // [CHANGED]
+
+      return successResponse(res, {
+        id: it.id,
+        orderId: it.orderId,
+        code: it.order?.code,
+        productId: it.productId,
+        qty: it.qty,
+        priceSnapshot: it.priceSnapshot ?? it.priceSnap,
+        status: it.status,
+        product: it.product
+          ? {
+              id: it.product.id,
+              title: it.product.title,
+              images: it.product.images,
+            }
+          : null,
+        createdAt: it.createdAt,
+        buyer: addressDetail
+          ? {
+              name: addressDetail.name ?? null,
+              phone: addressDetail.phone ?? null,
+            }
+          : null,
+        shipping: addressDetail
+          ? {
+              method: addressDetail.shippingMethod ?? null,
+              address: addressDetail.address ?? null,
+              city: addressDetail.city ?? null,
+              postalCode: addressDetail.postalCode ?? null,
+            }
+          : null,
+      });
+    } catch (e) {
+      console.error(e);
+      return errorResponse(res);
+    }
+  }
+);
+
+/**
+ * @swagger
  * /api/seller/order-items/{id}/status:
  *   patch:
  *     summary: Update status of an order item (seller-only)
+ *     description: Seller hanya boleh mengubah ke **CONFIRMED**, **SHIPPED**, atau **CANCELLED** mengikuti aturan transisi.
  *     tags: [Seller Fulfillment]
  *     security: [ { bearerAuth: [] } ]
  *     parameters:
