@@ -32,16 +32,10 @@ const { successResponse, errorResponse } = require("../utils/response");
  *         schema: { type: integer }
  *       - in: query
  *         name: sort
- *         schema:
- *           type: string
- *           enum: [price, rating, newest, popular]
- *           default: newest
+ *         schema: { type: string, enum: [price, rating, newest, popular], default: newest }
  *       - in: query
  *         name: order
- *         schema:
- *           type: string
- *           enum: [asc, desc]
- *           default: desc
+ *         schema: { type: string, enum: [asc, desc], default: desc }
  *       - in: query
  *         name: page
  *         schema: { type: integer, default: 1 }
@@ -61,6 +55,7 @@ router.get(
     query("limit").optional().isInt({ min: 1, max: 50 }),
     query("order").optional().isIn(["asc", "desc"]),
     query("sort").optional().isIn(["price", "rating", "newest", "popular"]),
+    query("q").optional().isString(),
   ],
   handleValidationErrors,
   async (req, res) => {
@@ -202,92 +197,154 @@ router.get(
   }
 );
 
-// /**
-//  * @swagger
-//  * /api/stores/{id}:
-//  *   get:
-//  *     summary: Get store detail + products (public)
-//  *     tags: [Products]
-//  *     parameters:
-//  *       - in: path
-//  *         name: id
-//  *         required: true
-//  *         schema: { type: integer }
-//  *       - in: query
-//  *         name: page
-//  *         schema: { type: integer, default: 1 }
-//  *       - in: query
-//  *         name: limit
-//  *         schema: { type: integer, default: 20, maximum: 50 }
-//  *     responses:
-//  *       200: { description: OK }
-//  *       404: { description: Not found }
-//  */
-// router.get(
-//   "/:id",
-//   [
-//     param("id").isInt({ min: 1 }),
-//     query("page").optional().isInt({ min: 1 }),
-//     query("limit").optional().isInt({ min: 1, max: 50 }),
-//   ],
-//   handleValidationErrors,
-//   async (req, res) => {
-//     try {
-//       const id = Number(req.params.id);
-//       const { page = 1, limit = 20 } = req.query;
+/**
+ * @swagger
+ * /api/stores/{id}:
+ *   get:
+ *     summary: Get store detail + products (public)
+ *     tags: [Products]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: integer }
+ *       - in: query
+ *         name: q
+ *         schema: { type: string }
+ *       - in: query
+ *         name: categoryId
+ *         schema: { type: integer }
+ *       - in: query
+ *         name: minPrice
+ *         schema: { type: integer }
+ *       - in: query
+ *         name: maxPrice
+ *         schema: { type: integer }
+ *       - in: query
+ *         name: sort
+ *         schema: { type: string, enum: [price, rating, newest, popular], default: newest }
+ *       - in: query
+ *         name: order
+ *         schema: { type: string, enum: [asc, desc], default: desc }
+ *       - in: query
+ *         name: page
+ *         schema: { type: integer, default: 1 }
+ *       - in: query
+ *         name: limit
+ *         schema: { type: integer, default: 20, maximum: 50 }
+ *     responses:
+ *       200: { description: OK }
+ *       404: { description: Not found }
+ */
+// [NEW] aktifkan lagi versi by-id dengan filter/sort seperti katalog
+router.get(
+  "/:id",
+  [
+    param("id").isInt({ min: 1 }),
+    query("q").optional().isString(),
+    query("categoryId").optional().isInt({ min: 1 }),
+    query("minPrice").optional().isInt({ min: 0 }),
+    query("maxPrice").optional().isInt({ min: 0 }),
+    query("sort").optional().isIn(["price", "rating", "newest", "popular"]),
+    query("order").optional().isIn(["asc", "desc"]),
+    query("page").optional().isInt({ min: 1 }),
+    query("limit").optional().isInt({ min: 1, max: 50 }),
+  ],
+  handleValidationErrors,
+  async (req, res) => {
+    try {
+      const id = Number(req.params.id);
+      const {
+        q,
+        categoryId,
+        minPrice,
+        maxPrice,
+        sort = "newest",
+        order = "desc",
+        page = 1,
+        limit = 20,
+      } = req.query;
 
-//       const shop = await prisma.shop.findUnique({
-//         where: { id },
-//         select: {
-//           id: true,
-//           name: true,
-//           slug: true,
-//           logo: true,
-//           address: true,
-//           isActive: true,
-//           createdAt: true,
-//           _count: { select: { products: true } },
-//         },
-//       });
-//       if (!shop) return errorResponse(res, "Store not found", 404);
+      const shop = await prisma.shop.findUnique({
+        where: { id },
+        select: {
+          id: true,
+          name: true,
+          slug: true,
+          logo: true,
+          address: true,
+          isActive: true,
+          createdAt: true,
+          _count: { select: { products: true } },
+        },
+      });
+      if (!shop) return errorResponse(res, "Store not found", 404);
 
-//       const [products, total] = await Promise.all([
-//         prisma.product.findMany({
-//           where: { shopId: id, isActive: true },
-//           skip: (Number(page) - 1) * Number(limit),
-//           take: Number(limit),
-//           orderBy: { createdAt: "desc" },
-//           select: {
-//             id: true,
-//             title: true,
-//             slug: true,
-//             price: true,
-//             stock: true,
-//             images: true,
-//             rating: true,
-//             reviewCount: true,
-//             soldCount: true,
-//           },
-//         }),
-//         prisma.product.count({ where: { shopId: id, isActive: true } }),
-//       ]);
+      const orderMap = {
+        price: { price: order },
+        rating: { rating: order },
+        newest: { createdAt: order },
+        popular: { soldCount: order },
+      };
+      const orderBy = orderMap[sort] || { createdAt: "desc" };
 
-//       return successResponse(res, {
-//         shop,
-//         products,
-//         pagination: {
-//           page: Number(page),
-//           limit: Number(limit),
-//           total,
-//           totalPages: Math.ceil(total / Number(limit)),
-//         },
-//       });
-//     } catch (e) {
-//       console.error("store detail error:", e);
-//       return errorResponse(res);
-//     }
-//   }
-// );
+      const where = {
+        shopId: id,
+        isActive: true,
+        ...(q && {
+          OR: [
+            { title: { contains: q, mode: "insensitive" } },
+            { description: { contains: q, mode: "insensitive" } },
+          ],
+        }),
+        ...(categoryId && { categoryId: Number(categoryId) }),
+        ...((minPrice || maxPrice) && {
+          price: {
+            ...(minPrice && { gte: Number(minPrice) }),
+            ...(maxPrice && { lte: Number(maxPrice) }),
+          },
+        }),
+      };
+
+      const [products, total] = await Promise.all([
+        prisma.product.findMany({
+          where,
+          skip: (Number(page) - 1) * Number(limit),
+          take: Number(limit),
+          orderBy,
+          select: {
+            id: true,
+            title: true,
+            slug: true,
+            price: true,
+            stock: true,
+            images: true,
+            rating: true,
+            reviewCount: true,
+            soldCount: true,
+            category: { select: { id: true, name: true, slug: true } }, // [NEW]
+          },
+        }),
+        prisma.product.count({ where }),
+      ]);
+
+      return successResponse(res, {
+        shop,
+        products,
+        pagination: {
+          page: Number(page),
+          limit: Number(limit),
+          total,
+          totalPages: Math.ceil(total / Number(limit)),
+        },
+      });
+    } catch (e) {
+      console.error("store detail error:", e);
+      return errorResponse(res);
+    }
+  }
+);
+
 /**
  * @swagger
  * /api/stores/slug/{slug}:
@@ -299,6 +356,24 @@ router.get(
  *         name: slug
  *         required: true
  *         schema: { type: string }
+ *       - in: query
+ *         name: q
+ *         schema: { type: string }
+ *       - in: query
+ *         name: categoryId
+ *         schema: { type: integer }
+ *       - in: query
+ *         name: minPrice
+ *         schema: { type: integer }
+ *       - in: query
+ *         name: maxPrice
+ *         schema: { type: integer }
+ *       - in: query
+ *         name: sort
+ *         schema: { type: string, enum: [price, rating, newest, popular], default: newest }
+ *       - in: query
+ *         name: order
+ *         schema: { type: string, enum: [asc, desc], default: desc }
  *       - in: query
  *         name: page
  *         schema: { type: integer, default: 1 }
@@ -313,6 +388,12 @@ router.get(
   "/slug/:slug",
   [
     param("slug").isString().trim().isLength({ min: 1 }),
+    query("q").optional().isString(), // [NEW]
+    query("categoryId").optional().isInt({ min: 1 }), // [NEW]
+    query("minPrice").optional().isInt({ min: 0 }), // [NEW]
+    query("maxPrice").optional().isInt({ min: 0 }), // [NEW]
+    query("sort").optional().isIn(["price", "rating", "newest", "popular"]), // [NEW]
+    query("order").optional().isIn(["asc", "desc"]), // [NEW]
     query("page").optional().isInt({ min: 1 }),
     query("limit").optional().isInt({ min: 1, max: 50 }),
   ],
@@ -320,7 +401,16 @@ router.get(
   async (req, res) => {
     try {
       const { slug } = req.params;
-      const { page = 1, limit = 20 } = req.query;
+      const {
+        q,
+        categoryId,
+        minPrice,
+        maxPrice,
+        sort = "newest",
+        order = "desc",
+        page = 1,
+        limit = 20,
+      } = req.query;
 
       const shop = await prisma.shop.findUnique({
         where: { slug },
@@ -337,12 +427,38 @@ router.get(
       });
       if (!shop) return errorResponse(res, "Store not found", 404);
 
+      const orderMap = {
+        price: { price: order },
+        rating: { rating: order },
+        newest: { createdAt: order },
+        popular: { soldCount: order },
+      };
+      const orderBy = orderMap[sort] || { createdAt: "desc" };
+
+      const where = {
+        shopId: shop.id,
+        isActive: true,
+        ...(q && {
+          OR: [
+            { title: { contains: q, mode: "insensitive" } },
+            { description: { contains: q, mode: "insensitive" } },
+          ],
+        }),
+        ...(categoryId && { categoryId: Number(categoryId) }),
+        ...((minPrice || maxPrice) && {
+          price: {
+            ...(minPrice && { gte: Number(minPrice) }),
+            ...(maxPrice && { lte: Number(maxPrice) }),
+          },
+        }),
+      };
+
       const [products, total] = await Promise.all([
         prisma.product.findMany({
-          where: { shopId: shop.id, isActive: true },
+          where,
           skip: (Number(page) - 1) * Number(limit),
           take: Number(limit),
-          orderBy: { createdAt: "desc" },
+          orderBy,
           select: {
             id: true,
             title: true,
@@ -353,9 +469,10 @@ router.get(
             rating: true,
             reviewCount: true,
             soldCount: true,
+            category: { select: { id: true, name: true, slug: true } }, // [CHANGED]
           },
         }),
-        prisma.product.count({ where: { shopId: shop.id, isActive: true } }),
+        prisma.product.count({ where }),
       ]);
 
       return successResponse(res, {
