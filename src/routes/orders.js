@@ -65,7 +65,10 @@ const buildOrderResponse = (order) => {
  * /api/orders/checkout:
  *   post:
  *     summary: Checkout cart -> create Orders per shop (payment mock=PAID)
- *     description: Membuat **satu order per toko** dari isi cart. Menyimpan snapshot alamat lengkap & shipping method di setiap order.
+ *     description: >
+ *       - Membuat **satu order per toko** dari isi cart.
+ *       - Kirim **selectedItemIds** untuk checkout **sebagian** isi cart (hanya item yang dipilih).
+ *       - Menyimpan snapshot alamat lengkap & shipping method di setiap order.
  *     tags: [Orders]
  *     security: [ { bearerAuth: [] } ]
  *     requestBody:
@@ -88,39 +91,51 @@ const buildOrderResponse = (order) => {
  *               shippingMethod:
  *                 type: string
  *                 example: "JNE REG"
- *                 description: Metode pengiriman (mock) yang akan disimpan di snapshot order.
+ *               selectedItemIds:
+ *                 type: array
+ *                 description: Daftar **cartItem.id** yang ingin di-checkout. Jika tidak diisi, seluruh isi cart akan di-checkout.
+ *                 items: { type: integer, example: 72 }
  *     responses:
- *       200:
- *         description: Orders created (one per shop)
- *       400:
- *         description: Cart empty / stock invalid
- *       401:
- *         description: Unauthorized
+ *       200: { description: Orders created (one per shop) }
+ *       400: { description: Cart empty / stock invalid / selection invalid }
+ *       401: { description: Unauthorized }
  */
 router.post(
   "/checkout",
   authenticateToken,
   [
-    // [NEW] validasi nested address fields
+    // alamat & shipping
     body("address.name").isString().trim().isLength({ min: 2 }),
     body("address.phone").isString().trim().isLength({ min: 6 }),
     body("address.city").isString().trim().isLength({ min: 2 }),
     body("address.postalCode").isString().trim().isLength({ min: 3 }),
     body("address.address").isString().trim().isLength({ min: 5 }),
     body("shippingMethod").optional().isString().trim().isLength({ min: 2 }),
+    // [NEW] validasi selected item ids
+    body("selectedItemIds").optional().isArray(),
+    body("selectedItemIds.*").optional().isInt({ min: 1 }),
   ],
   handleValidationErrors,
   async (req, res) => {
     const userId = req.user.id;
     const { address, shippingMethod } = req.body;
+    const selectedIds = Array.isArray(req.body.selectedItemIds)
+      ? req.body.selectedItemIds.map((x) => Number(x))
+      : [];
 
     try {
-      // 1) Ambil cart + item beserta product & shop
+      // 1) Ambil cart user
       const cart = await prisma.cart.findUnique({ where: { userId } });
       if (!cart) return errorResponse(res, "Cart is empty", 400);
 
+      // 2) Ambil items (semua atau yang dipilih)
+      const itemWhere = {
+        cartId: cart.id,
+        ...(selectedIds.length && { id: { in: selectedIds } }),
+      };
+
       const items = await prisma.cartItem.findMany({
-        where: { cartId: cart.id },
+        where: itemWhere,
         include: {
           product: {
             select: {
@@ -135,9 +150,30 @@ router.post(
           },
         },
       });
+
+      // [NEW] validasi pemilihan: kalau user kirim selectedIds tapi ga ketemu semua
+      if (selectedIds.length) {
+        if (items.length === 0)
+          return errorResponse(
+            res,
+            "No selected items found in your cart",
+            400
+          );
+        // Pastikan semua ID yang dikirim memang milik cart user
+        const found = new Set(items.map((it) => it.id));
+        const missing = selectedIds.filter((id) => !found.has(id));
+        if (missing.length) {
+          return errorResponse(
+            res,
+            "Some selected items are not in your cart",
+            400
+          );
+        }
+      }
+
       if (items.length === 0) return errorResponse(res, "Cart is empty", 400);
 
-      // 2) Validasi stok & availability terkini
+      // 3) Validasi stok & availability terkini
       for (const it of items) {
         if (!it.product || !it.product.isActive) {
           return errorResponse(
@@ -155,7 +191,7 @@ router.post(
         }
       }
 
-      // 3) Group items by shopId
+      // 4) Group by shopId
       const groups = new Map(); // shopId -> items[]
       for (const it of items) {
         const key = it.product.shopId;
@@ -163,13 +199,13 @@ router.post(
         groups.get(key).push(it);
       }
 
-      // [NEW] gabungkan shippingMethod ke snapshot alamat agar tersalin ke setiap order
+      // Snapshot alamat + shipping
       const addressSnapObj = {
         ...address,
         shippingMethod: shippingMethod ?? null,
       };
 
-      // 4) Transaksi: MULTI ORDER (1 per toko), update stok, kosongkan cart
+      // 5) Transaksi: buat order per toko, update stok, hapus item dari cart (hanya yang diproses)
       const createdOrders = await prisma.$transaction(async (tx) => {
         const results = [];
 
@@ -184,14 +220,12 @@ router.post(
             data: {
               userId,
               code,
-              paymentStatus: "PAID", // mock payment
+              paymentStatus: "PAID", // mock
               totalAmount,
-              // [CHANGED] kolom DB string → simpan string JSON
-              addressSnap: JSON.stringify(addressSnapObj),
+              addressSnap: JSON.stringify(addressSnapObj), // simpan sebagai string JSON
             },
           });
 
-          // Buat item per toko
           for (const it of groupItems) {
             await tx.orderItem.create({
               data: {
@@ -201,11 +235,10 @@ router.post(
                 qty: it.qty,
                 status: "NEW",
                 titleSnap: it.product.title,
-                priceSnap: it.product.price, // snapshot harga saat checkout
+                priceSnap: it.product.price,
               },
             });
 
-            // Decrement stok
             await tx.product.update({
               where: { id: it.productId },
               data: {
@@ -218,13 +251,19 @@ router.post(
           results.push(order);
         }
 
-        // Kosongkan cart setelah semua order terbentuk
-        await tx.cartItem.deleteMany({ where: { cartId: cart.id } });
+        // [NEW] Hapus dari cart: kalau ada selectedIds → hapus yang dipilih saja; else → kosongkan cart
+        if (selectedIds.length) {
+          await tx.cartItem.deleteMany({
+            where: { cartId: cart.id, id: { in: selectedIds } },
+          });
+        } else {
+          await tx.cartItem.deleteMany({ where: { cartId: cart.id } });
+        }
 
         return results;
       });
 
-      // 5) Ambil detail order untuk response
+      // 6) Ambil detail buat response
       const fullOrders = await prisma.order.findMany({
         where: { id: { in: createdOrders.map((o) => o.id) } },
         include: {
